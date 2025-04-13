@@ -1,55 +1,158 @@
+import { Anthropic } from '@anthropic-ai/sdk'
+import { MessageParam, Tool } from '@anthropic-ai/sdk/resources/messages/messages.mjs'
 import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
-import path from 'path'
-import { fileURLToPath } from 'url'
-// Get the directory of the current file
-const __dirname = path.dirname(fileURLToPath(import.meta.url))
+import readline from 'readline/promises'
+import dotenv from 'dotenv'
 
-const transport = new StdioClientTransport({
-  command: 'node',
-  args: [path.join(__dirname, 'server.js')],
-})
+dotenv.config()
 
-const client = new Client({
-  name: 'example-client',
-  version: '1.0.0',
-})
+const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY
+if (!ANTHROPIC_API_KEY) {
+  throw new Error('ANTHROPIC_API_KEY is not set')
+}
 
-await client.connect(transport)
+class MCPClient {
+  private mcp: Client
+  private anthropic: Anthropic
+  private transport: StdioClientTransport | null = null
+  private tools: Tool[] = []
 
-// List prompts
-const prompts = await client.listPrompts()
+  constructor() {
+    this.anthropic = new Anthropic({
+      apiKey: ANTHROPIC_API_KEY,
+    })
+    this.mcp = new Client({ name: 'mcp-client-cli', version: '1.0.0' })
+  }
 
-console.log('Prompts:', JSON.stringify(prompts, null, 2))
+  async connectToServer(serverScriptPath: string) {
+    try {
+      const isJs = serverScriptPath.endsWith('.js')
+      const isPy = serverScriptPath.endsWith('.py')
+      if (!isJs && !isPy) {
+        throw new Error('Server script must be a .js or .py file')
+      }
+      const command = isPy
+        ? process.platform === 'win32'
+          ? 'python'
+          : 'python3'
+        : process.execPath
 
-// Get a prompt
-const prompt = await client.getPrompt({
-  name: 'echo',
-  arguments: {
-    message: 'Hello, world!',
-  },
-})
+      this.transport = new StdioClientTransport({
+        command,
+        args: [serverScriptPath],
+      })
+      this.mcp.connect(this.transport)
 
-console.log('Echo Prompt:', JSON.stringify(prompt, null, 2))
+      const toolsResult = await this.mcp.listTools()
+      this.tools = toolsResult.tools.map((tool) => {
+        return {
+          name: tool.name,
+          description: tool.description,
+          input_schema: tool.inputSchema,
+        }
+      })
+      console.log(
+        'Connected to server with tools:',
+        this.tools.map(({ name }) => name),
+      )
+    } catch (e) {
+      console.log('Failed to connect to MCP server: ', e)
+      throw e
+    }
+  }
 
-// List resources
-const resources = await client.listResources()
+  async processQuery(query: string) {
+    const messages: MessageParam[] = [
+      {
+        role: 'user',
+        content: query,
+      },
+    ]
 
-console.log('Resources:', JSON.stringify(resources, null, 2))
+    const response = await this.anthropic.messages.create({
+      model: 'claude-3-5-sonnet-20241022',
+      max_tokens: 1000,
+      messages,
+      tools: this.tools,
+    })
 
-// Read a resource
-const resource = await client.readResource({
-  uri: 'echo://Helloworld!',
-})
+    const finalText = []
+    const toolResults = []
 
-console.log('Resource:', JSON.stringify(resource, null, 2))
+    for (const content of response.content) {
+      if (content.type === 'text') {
+        finalText.push(content.text)
+      } else if (content.type === 'tool_use') {
+        const toolName = content.name
+        const toolArgs = content.input as { [x: string]: unknown } | undefined
 
-// Call a tool
-const result = await client.callTool({
-  name: 'echo',
-  arguments: {
-    message: 'Hello, world!',
-  },
-})
+        const result = await this.mcp.callTool({
+          name: toolName,
+          arguments: toolArgs,
+        })
+        toolResults.push(result)
+        finalText.push(`[Calling tool ${toolName} with args ${JSON.stringify(toolArgs)}]`)
 
-console.log('Echo Result:', JSON.stringify(result, null, 2))
+        messages.push({
+          role: 'user',
+          content: result.content as string,
+        })
+
+        const response = await this.anthropic.messages.create({
+          model: 'claude-3-5-sonnet-20241022',
+          max_tokens: 1000,
+          messages,
+        })
+
+        finalText.push(response.content[0].type === 'text' ? response.content[0].text : '')
+      }
+    }
+
+    return finalText.join('\n')
+  }
+
+  async chatLoop() {
+    const rl = readline.createInterface({
+      input: process.stdin,
+      output: process.stdout,
+    })
+
+    try {
+      console.log('\nMCP Client Started!')
+      console.log("Type your queries or 'quit' to exit.")
+
+      while (true) {
+        const message = await rl.question('\nQuery: ')
+        if (message.toLowerCase() === 'quit') {
+          break
+        }
+        const response = await this.processQuery(message)
+        console.log('\n' + response)
+      }
+    } finally {
+      rl.close()
+    }
+  }
+
+  async cleanup() {
+    await this.mcp.close()
+  }
+}
+
+async function main() {
+  if (process.argv.length < 3) {
+    console.log('Usage: node index.ts <path_to_server_script>')
+    return
+  }
+  const mcpClient = new MCPClient()
+  try {
+    await mcpClient.connectToServer(process.argv[2])
+    await mcpClient.chatLoop()
+  } finally {
+    await mcpClient.cleanup()
+    process.exit(0)
+  }
+}
+
+main()
