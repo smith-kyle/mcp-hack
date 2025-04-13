@@ -1,0 +1,20 @@
+{
+  "type": "module",
+  "bin": {
+    "server": "./build/server.js"
+  },
+  "scripts": {
+    "build": "tsc && chmod 755 build/server.js && chmod 755 build/client.js"
+  },
+  "files": [
+    "build"
+  ],
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.9.0",
+    "zod": "^3.24.2"
+  },
+  "devDependencies": {
+    "@types/node": "^22.14.1",
+    "typescript": "^5.8.3"
+  }
+}
