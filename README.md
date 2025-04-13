@@ -2,5 +2,5 @@
 
 ```bash
 yarn build
-node build/client.js
+node build/client.js ./build/server.js
 ```
